@@ -1,5 +1,7 @@
 import base64
 import os
+from datetime import datetime
+
 import requests
 import time
 from dotenv import load_dotenv
@@ -19,10 +21,10 @@ CHECK_TASK_URL = "https://api.hamsterkombat.io/clicker/check-task"
 DONE_MESSAGE = "DONE!"
 ERROR_MESSAGE = "ERROR!"
 
-PROFIT_TO_PRICE_RATIO = float(os.getenv('PROFIT_TO_PRICE_RATIO'))
 WELCOME_SCREEN = os.getenv('WELCOME_SCREEN') == 'True'
 SLEEP_TIME = int(os.getenv('SLEEP_TIME'))
 MINIMUM_BALANCE = float(os.getenv('MINIMUM_BALANCE'))
+MAX_PROFIT_TO_PRICE_RATIO = int(os.getenv('MAX_DAYS_TO_PROFIT')) * 24
 
 AUTH_TOKENS = []
 
@@ -98,37 +100,47 @@ def get_cipher_for_user(auth_token) -> None:
         print("Error:", response.status_code)
 
 
-def is_card_valid(card, balance, data):
+def is_card_valid(card, balance, data) -> bool:
     upgrade = next((upgrade for upgrade in data["upgradesForBuy"] if upgrade["id"] == card), None)
 
-    if not upgrade or upgrade['isAvailable'] or upgrade['condition']["_type"] != 'ByUpgrade':
+    if not upgrade or (upgrade['condition'] and upgrade['condition']["_type"] != 'ByUpgrade'):
+        print(f"Card {card} is not available for purchase!")
         return False
+
+    if upgrade['condition'] is None:
+        return True
 
     condition_card = {'level': upgrade['condition']["level"], 'id': upgrade['condition']["upgradeId"]}
     condition_upgrade = next(
         (upgrade for upgrade in data["upgradesForBuy"] if upgrade["id"] == condition_card['id']), None)
     if not condition_upgrade:
+        print(f"Condition upgrade for card {card} is not available for purchase!")
         return False
 
     levels_needed = condition_card['level'] - condition_upgrade['level']
     if condition_upgrade['price'] * 1.07 ** levels_needed > balance:
+        print(f"Balance is not enough to buy card {card}!")
         return False
 
     return True
 
 
-def buy_card(auth_token, card, balance, data):
+def buy_card_with_conditions(auth_token, card, balance, data):
     upgrade = next((upgrade for upgrade in data["upgradesForBuy"] if upgrade["id"] == card), None)
-    condition_card = {'level': upgrade['condition']["level"], 'id': upgrade['condition']["upgradeId"]}
-    condition_upgrade = next(
-        (upgrade for upgrade in data["upgradesForBuy"] if upgrade["id"] == condition_card['id']), None)
 
-    levels_needed = condition_card['level'] - condition_upgrade['level']
-    for _ in range(levels_needed + 1):
-        balance -= condition_upgrade['price']
-        buy_upgrade_by_id(auth_token, condition_card['id'])
+    if upgrade['condition'] is not None:
+        condition_card = {'level': upgrade['condition']["level"], 'id': upgrade['condition']["upgradeId"]}
+        condition_upgrade = next(
+            (upgrade for upgrade in data["upgradesForBuy"] if upgrade["id"] == condition_card['id']), None)
 
-    return balance - upgrade["price"]
+        levels_needed = condition_card['level'] - condition_upgrade['level']
+        for _ in range(levels_needed + 1):
+            balance -= condition_upgrade['price']
+            buy_upgrade_by_id(auth_token, condition_card['id'])
+
+    buy_upgrade_by_id(auth_token, card)
+    balance -= upgrade["price"]
+    return balance
 
 
 def get_daily_combo_for_user(auth_token) -> None:
@@ -139,21 +151,34 @@ def get_daily_combo_for_user(auth_token) -> None:
         print("ALREADY CLAIMED!")
         return
 
-    combo_cards = requests.post(DAILY_COMBO_URL).json()["combo"]
+    daily_combo_data = requests.post(DAILY_COMBO_URL).json()
+    combo_cards = daily_combo_data["combo"]
+    date = daily_combo_data["date"]
+    current_date = datetime.now().date()
+    date_to_compare = datetime.strptime(date, "%d-%m-%y").date()
+    if current_date != date_to_compare:
+        print("DAILY COMBO IS NOT AVAILABLE!")
+        return
+
     taken_combo_cards = [card for card in data["dailyCombo"]["upgradeIds"]]
     cards_to_buy = [card for card in combo_cards if card not in taken_combo_cards]
 
     balance = get_user_balance(auth_token)
     for card in cards_to_buy:
         if is_card_valid(card, balance, data):
-            balance = buy_card(auth_token, card, balance, data)
+            balance = buy_card_with_conditions(auth_token, card, balance, data)
+            # print(f"Bought card {card}!")
+        # print(f"Card {card} is not available for purchase!")
 
+    data = requests.post(UPGRADES_FOR_BUY_URL, headers={"Authorization": auth_token}).json()
     if len(data["dailyCombo"]["upgradeIds"]) == 3:
         response = requests.post(CLAIM_DAILY_COMBO_URL, headers={"Authorization": auth_token})
         if response.status_code == 200:
             print(DONE_MESSAGE)
         else:
             print(ERROR_MESSAGE, response.status_code)
+        return
+    print(ERROR_MESSAGE)
 
 
 def buy_upgrade_by_id(auth_token, upgrade_id) -> None:
@@ -161,12 +186,12 @@ def buy_upgrade_by_id(auth_token, upgrade_id) -> None:
         "upgradeId": upgrade_id,
         "timestamp": int(time.time())
     })
-    print("Bought upgrade with ID:", upgrade_id)
+    #print("Bought upgrade with ID:", upgrade_id)
 
 
 def is_upgrade_valid(upgrade, balance):
     price = upgrade["price"]
-    profit_per_hour = upgrade["profitPerHour"]
+    profit_per_hour_delta = upgrade["profitPerHourDelta"]
     is_available = upgrade["isAvailable"]
     is_expired = upgrade["isExpired"]
 
@@ -176,7 +201,7 @@ def is_upgrade_valid(upgrade, balance):
     if not is_available or is_expired:
         return False
 
-    if profit_per_hour <= 0 or price / profit_per_hour > PROFIT_TO_PRICE_RATIO:
+    if profit_per_hour_delta <= 0 or price / profit_per_hour_delta > MAX_PROFIT_TO_PRICE_RATIO:
         return False
 
     if balance - price <= MINIMUM_BALANCE:
@@ -185,33 +210,63 @@ def is_upgrade_valid(upgrade, balance):
     return True
 
 
+def buy_upgrade(auth_token, upgrade, balance) -> float:
+    buy_upgrade_by_id(auth_token, upgrade['id'])
+    balance -= upgrade["price"]
+    upgrade['level'] += 1
+    upgrade['price'] = upgrade['price'] * 1.05 ** (upgrade['level'])
+    upgrade['profitPerHourDelta'] *= 1.07
+    upgrade['efficiency'] = upgrade['price'] / upgrade['profitPerHourDelta']
+    return balance
+
+
 def buy_upgrades_for_user(auth_token) -> None:
     balance = get_user_balance(auth_token)
     if balance < MINIMUM_BALANCE:
         print("INSUFFICIENT BALANCE!")
         return
 
-    # Initialize a flag to track if an upgrade was bought in the last iteration
-    upgrade_bought = True
+    response = requests.post(UPGRADES_FOR_BUY_URL, headers={"Authorization": auth_token})
+    if response.status_code != 200:
+        print(ERROR_MESSAGE, response.status_code)
+        return
 
-    # Continue looping as long as an upgrade is being bought
-    while upgrade_bought:
-        upgrade_bought = False  # Reset the flag at the start of each iteration
+    data = response.json()
+    available_upgrades = [upgrade for upgrade in data["upgradesForBuy"] if is_upgrade_valid(upgrade, balance)]
 
-        response = requests.post(UPGRADES_FOR_BUY_URL, headers={"Authorization": auth_token})
-        if response.status_code != 200:
-            print(ERROR_MESSAGE, response.status_code)
-            return
-
-        data = response.json()
-        upgrade_objects = data["upgradesForBuy"]
-
-        for upgrade in upgrade_objects:
-            if is_upgrade_valid(upgrade, balance):
-                buy_upgrade_by_id(auth_token, upgrade['id'])
-                balance -= upgrade["price"]
-                upgrade_bought = True  # Set the flag to True if an upgrade was bought
-                break  # Break the loop as soon as an upgrade is bought
+    upgrade_objects = [
+        {'id': upgrade['id'], 'level': upgrade['level'], 'efficiency': upgrade['price'] / upgrade['profitPerHourDelta'],
+         'price': upgrade['price'], 'profitPerHourDelta': upgrade['profitPerHourDelta'],
+         'hasCooldown': 'totalCooldownSeconds' in upgrade}
+        for upgrade in available_upgrades]
+    # sort upgrades by efficiency
+    upgrade_objects.sort(key=lambda x: x['efficiency'], reverse=True)
+    #print(upgrade_objects)
+    while upgrade_objects:
+        for i in reversed(range(len(upgrade_objects))):
+            upgrade = upgrade_objects[i]
+            #print(f"Checking upgrade with ID: {upgrade['id']}, Efficiency: {upgrade['efficiency']}")
+            if balance - upgrade['price'] < MINIMUM_BALANCE:
+                #print(f"Pop upgrade with ID: {upgrade['id']} because of insufficient balance!")
+                upgrade_objects.pop(i)
+                continue
+            if i - 1 == 0:
+                balance = buy_upgrade(auth_token, upgrade, balance)
+                if upgrade['hasCooldown']:
+                    #print(f"Pop upgrade with ID: {upgrade['id']} because of cooldown!")
+                    break
+                continue
+            while i - 1 >= 0 and upgrade['efficiency'] < upgrade_objects[i - 1]['efficiency']:
+                if balance - upgrade['price'] < MINIMUM_BALANCE:
+                    #print(f"Pop upgrade with ID: {upgrade['id']} because of insufficient balance! 2")
+                    break
+                balance = buy_upgrade(auth_token, upgrade, balance)
+                if upgrade['hasCooldown']:
+                    #print(f"Pop upgrade with ID: {upgrade['id']} because of cooldown!")
+                    break
+            #print(f"Pop upgrade with ID: {upgrade['id']} because of lower efficiency!")
+            upgrade_objects.pop(i)
+        #print(upgrade_objects)
 
     print(DONE_MESSAGE)
 
@@ -232,6 +287,7 @@ def main():
             {"-" * 30}
             # User ID: {data["clickerUser"]["id"]:<17} #
             # Balance: {int(data["clickerUser"]["balanceCoins"]):<17} #
+            # Earn Per Hour: {int(data["clickerUser"]["earnPassivePerHour"]):<11} #
             # Available Taps: {data["clickerUser"]["availableTaps"]:<10} #
             {"-" * 30}
             ''')
